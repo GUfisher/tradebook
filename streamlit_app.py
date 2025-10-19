@@ -750,7 +750,8 @@ def main():
             viz_mode = st.radio(
                 "选择可视化模式",
                 ["分资产对比图", "单一资产详情", "组合级指标(仅Vega/Theta)"],
-                horizontal=True
+                horizontal=True,
+                key="viz_mode_selector"
             )
 
             if viz_mode == "组合级指标(仅Vega/Theta)":
@@ -781,7 +782,7 @@ def main():
 
             elif viz_mode == "单一资产详情":
                 # 选择单一标的查看详细信息
-                selected_underlying = st.selectbox("选择标的资产", underlying_list, index=0)
+                selected_underlying = st.selectbox("选择标的资产", underlying_list, index=0, key="underlying_selector")
 
                 # 按选定标的筛选数据
                 underlying_data = otc_trade[otc_trade['标的名称'] == selected_underlying].copy()
@@ -830,7 +831,8 @@ def main():
                 greek_to_plot = st.selectbox(
                     "选择希腊值指标",
                     ['DELTA(期权)', 'GAMMA', 'VEGA（1%）', 'THETA', '总盈亏', '隔夜盈亏'],
-                    index=0
+                    index=0,
+                    key="greek_selector"
                 )
 
                 # 添加说明
