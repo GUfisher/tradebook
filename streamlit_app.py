@@ -46,6 +46,50 @@ def load_data():
     df['观察日'] = pd.to_datetime(df['观察日'], errors='coerce')
     df['起始日期'] = pd.to_datetime(df['起始日期'], errors='coerce')
     df['到期日'] = pd.to_datetime(df['到期日'], errors='coerce')
+
+    # 计算delta cash、delta、spot price和TRS notional (与autoSheetStats.py保持一致)
+    def compute_delta_cash(row):
+        """当期权类型为NaN(TRS)时，使用DELTA(期权)，否则使用DELTA_CASH"""
+        if 'TRADE_KEYWORD.期权特殊类型' in df.columns:
+            option_type_col = 'TRADE_KEYWORD.期权特殊类型'
+        elif '期权类型' in df.columns:
+            option_type_col = '期权类型'
+        else:
+            return row.get('DELTA_CASH', row.get('DELTA(期权)', 0))
+
+        return row['DELTA(期权)'] if pd.isna(row[option_type_col]) else row.get('DELTA_CASH', 0)
+
+    def compute_delta(row):
+        """当期权类型为NaN(TRS)时，使用DELTA(TRS)，否则使用DELTA(期权)"""
+        if 'TRADE_KEYWORD.期权特殊类型' in df.columns:
+            option_type_col = 'TRADE_KEYWORD.期权特殊类型'
+        elif '期权类型' in df.columns:
+            option_type_col = '期权类型'
+        else:
+            return row.get('DELTA(期权)', 0)
+
+        return row.get('DELTA(TRS)', 0) if pd.isna(row[option_type_col]) else row['DELTA(期权)']
+
+    def compute_TRS_notional(row):
+        """当期权类型为NaN且交易状态不是TERMINATED时，使用名义本金"""
+        if 'TRADE_KEYWORD.期权特殊类型' in df.columns:
+            option_type_col = 'TRADE_KEYWORD.期权特殊类型'
+        elif '期权类型' in df.columns:
+            option_type_col = '期权类型'
+        else:
+            return 0
+
+        return row['名义本金'] if (pd.isna(row[option_type_col]) and row['交易状态'] != 'TERMINATED') else 0
+
+    # 计算新列
+    df['delta cash'] = df.apply(compute_delta_cash, axis=1)
+    df['delta'] = df.apply(compute_delta, axis=1)
+
+    # 计算spot price = delta cash / delta (避免除零)
+    df['spot price'] = df.apply(lambda row: row['delta cash'] / row['delta'] if row['delta'] != 0 else row.get('spot price', 0), axis=1)
+
+    df['TRS notional'] = df.apply(compute_TRS_notional, axis=1)
+
     return df
 
 def expand_observation_dates(df):
@@ -522,6 +566,7 @@ def create_metric_chart(picked_data, metric_name, title):
 
     return fig
 
+
 # 主应用
 def main():
     st.markdown('<div class="main-header">📊 交易信息汇总看板</div>', unsafe_allow_html=True)
@@ -539,7 +584,7 @@ def main():
 
     # 交易ID选择
     trade_ids = ['全部'] + list(otc_trade['Trade Id'].unique())
-    selected_trade_id = st.sidebar.selectbox("选择 Trade ID", trade_ids, index=0)
+    selected_trade_id = st.sidebar.selectbox("选择 Trade ID", trade_ids, index=0, key="sidebar_trade_id")
 
     # 日期选择
     st.sidebar.subheader("📅 日期选择")
@@ -552,7 +597,8 @@ def main():
         "当前日期",
         available_dates,
         index=default_current_idx,
-        format_func=lambda x: x.strftime('%Y-%m-%d')
+        format_func=lambda x: x.strftime('%Y-%m-%d'),
+        key="sidebar_current_date"
     )
 
     # 创建标签页
@@ -618,44 +664,42 @@ def main():
 
             # 组合希腊值汇总
             st.markdown("### 📊 组合希腊值")
-            col1, col2, col3, col4, col5 = st.columns(5)
+            st.info("💡 注意：Delta 和 Gamma 是相对于各自标的资产的敏感度，不能跨标的直接加总。组合级别请查看 Delta Cash 风险。")
+
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
-                total_delta = latest_data['DELTA(期权)'].sum()
-                st.metric("组合 Delta", f"{total_delta:,.2f}")
+                total_vega = current_date_data['VEGA'].sum()
+                st.metric("组合 Vega", f"{total_vega:,.2f}",
+                         help="波动率敏感度，可跨标的加总")
             with col2:
-                total_gamma = latest_data['GAMMA'].sum()
-                st.metric("组合 Gamma", f"{total_gamma:,.2f}")
+                total_theta = current_date_data['THETA'].sum()
+                st.metric("组合 Theta", f"{total_theta:,.2f}",
+                         help="时间价值衰减，可跨标的加总")
             with col3:
-                total_vega = latest_data['VEGA'].sum()
-                st.metric("组合 Vega", f"{total_vega:,.2f}")
+                total_rho = current_date_data['RHO'].sum()
+                st.metric("组合 Rho", f"{total_rho:,.2f}",
+                         help="利率敏感度，可跨标的加总")
             with col4:
-                total_theta = latest_data['THETA'].sum()
-                st.metric("组合 Theta", f"{total_theta:,.2f}")
-            with col5:
-                total_rho = latest_data['RHO'].sum()
-                st.metric("组合 Rho", f"{total_rho:,.2f}")
+                # Delta Cash 作为组合级别的方向性风险指标
+                total_delta_cash = current_date_data['delta cash'].sum()
+                st.metric("组合 Delta Cash", f"{total_delta_cash:,.2f}",
+                         help="方向性现金风险敞口（所有标的）")
 
             st.markdown("---")
 
             # 组合风险分析
             st.markdown("### ⚠️ 组合风险分析")
 
-            # 计算每个交易的风险指标，然后求和（Delta现金风险剔除EquityLinkedSwap）
+            # 计算每个交易的风险指标，然后求和（与按资产分类统计保持一致）
             delta_cash_risks = []
             gamma_risks = []
             vega_risks = []
             theta_risks = []
-            excluded_count = 0  # 统计剔除的交易数量
 
-            for idx, row in latest_data.iterrows():
-                # Delta现金风险 = Delta × Spot Price (剔除EquityLinkedSwap和None类型)
-                if pd.notna(row['DELTA(期权)']) and pd.notna(row.get('spot price')):
-                    option_type = row['TRADE_KEYWORD.期权特殊类型']
-                    # 剔除 EquityLinkedSwap 和 None（空值）
-                    if option_type == 'EquityLinkedSwap' or pd.isna(option_type):
-                        excluded_count += 1
-                    else:
-                        delta_cash_risks.append(row['DELTA(期权)'] * row['spot price'])
+            for idx, row in current_date_data.iterrows():
+                # Delta现金风险 = delta cash
+                if pd.notna(row.get('delta cash')):
+                    delta_cash_risks.append(row['delta cash'])
 
                 # Gamma风险 = Gamma × Spot² × 1%
                 if pd.notna(row['GAMMA']) and pd.notna(row.get('spot price')):
@@ -673,11 +717,9 @@ def main():
             with col1:
                 if delta_cash_risks:
                     portfolio_delta_risk = sum(delta_cash_risks)
-                    st.metric("组合Delta现金风险", f"{portfolio_delta_risk:,.2f}",
-                             help=f"已剔除 {excluded_count} 笔交易（EquityLinkedSwap或期权类型为空）")
+                    st.metric("组合Delta现金风险", f"{portfolio_delta_risk:,.2f}")
                 else:
-                    st.metric("组合Delta现金风险", "N/A",
-                             help=f"已剔除 {excluded_count} 笔交易（EquityLinkedSwap或期权类型为空）")
+                    st.metric("组合Delta现金风险", "N/A")
 
             with col2:
                 if gamma_risks:
@@ -702,8 +744,96 @@ def main():
 
             st.markdown("---")
 
-            # 显示当前日期所有交易汇总表
-            st.markdown(f"### 📋 {current_date.strftime('%Y-%m-%d')} 所有交易汇总")
+            # 按标的资产分组展示统计信息
+            st.markdown(f"### 📋 {current_date.strftime('%Y-%m-%d')} 按资产分类统计")
+            st.info("💡 Delta 和 Gamma 按标的分别汇总，但不在组合层面（总和行）加总，因为它们是相对于各自标的的敏感度指标。")
+
+            # 创建按标的资产分组的汇总表
+            underlying_summary = current_date_data.groupby('标的名称').agg({
+                'Trade Id': 'count',  # 交易笔数
+                'spot price': 'first',  # 对同一标的取第一个值(应该相同)
+                '波动率': 'mean',  # 使用平均值而不是first，避免为0
+                'delta cash': 'sum',
+                'delta': 'sum',
+                'DELTA(期权)': 'sum',  # 添加DELTA(期权)用于展示
+                'GAMMA': 'sum',
+                'VEGA（1%）': 'sum',
+                'THETA': 'sum',
+                'TRS notional': 'sum',
+                '名义本金': 'sum',
+                '期权估值 NPV': 'sum',
+                '总盈亏': 'sum',
+                '隔夜盈亏': 'sum'
+            }).reset_index()
+
+            # 重命名列，调整顺序使其更直观
+            underlying_summary.columns = ['标的名称', '交易笔数', 'Spot Price', '波动率(%)',
+                                         'Delta Cash', 'Delta', 'Delta(期权)', 'Gamma',
+                                         'Vega(1%)', 'Theta', 'TRS名义本金', '名义本金', 'NPV', '总盈亏', '隔夜盈亏']
+
+            # 添加总计行（Delta和Gamma不加总）
+            total_row = pd.DataFrame({
+                '标的名称': ['总和'],
+                '交易笔数': [underlying_summary['交易笔数'].sum()],
+                'Spot Price': [None],
+                '波动率(%)': [None],
+                'Delta Cash': [underlying_summary['Delta Cash'].sum()],
+                'Delta': [None],  # Delta不跨标的加总
+                'Delta(期权)': [None],  # Delta(期权)不跨标的加总
+                'Gamma': [None],  # Gamma不跨标的加总
+                'Vega(1%)': [underlying_summary['Vega(1%)'].sum()],
+                'Theta': [underlying_summary['Theta'].sum()],
+                'TRS名义本金': [underlying_summary['TRS名义本金'].sum()],
+                '名义本金': [underlying_summary['名义本金'].sum()],
+                'NPV': [underlying_summary['NPV'].sum()],
+                '总盈亏': [underlying_summary['总盈亏'].sum()],
+                '隔夜盈亏': [underlying_summary['隔夜盈亏'].sum()]
+            })
+
+            underlying_summary = pd.concat([underlying_summary, total_row], ignore_index=True)
+
+            # 格式化数值列 - 使用lambda函数处理None值
+            def safe_format(fmt):
+                """安全的格式化函数，处理None和NaN值"""
+                def formatter(x):
+                    if pd.isna(x) or x is None:
+                        return ''
+                    return fmt.format(x)
+                return formatter
+
+            format_dict = {
+                '交易笔数': safe_format('{:.0f}'),
+                'Spot Price': safe_format('{:,.2f}'),
+                '波动率(%)': safe_format('{:.4f}'),
+                'Delta Cash': safe_format('{:,.2f}'),
+                'Delta': safe_format('{:,.2f}'),
+                'Delta(期权)': safe_format('{:,.2f}'),
+                'Gamma': safe_format('{:,.2f}'),
+                'Vega(1%)': safe_format('{:,.2f}'),
+                'Theta': safe_format('{:,.2f}'),
+                'TRS名义本金': safe_format('{:,.0f}'),
+                '名义本金': safe_format('{:,.0f}'),
+                'NPV': safe_format('{:,.2f}'),
+                '总盈亏': safe_format('{:,.2f}'),
+                '隔夜盈亏': safe_format('{:,.2f}')
+            }
+
+            # 使用样式高亮总和行
+            def highlight_total_row(row):
+                if row['标的名称'] == '总和':
+                    return ['background-color: #f0f2f6; font-weight: bold'] * len(row)
+                return [''] * len(row)
+
+            st.dataframe(
+                underlying_summary.style.format(format_dict).apply(highlight_total_row, axis=1),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.markdown("---")
+
+            # 显示当前日期所有交易明细表
+            st.markdown(f"### 📋 {current_date.strftime('%Y-%m-%d')} 交易明细")
             summary_df = current_date_data[['Trade Id', '标的名称', 'TRADE_KEYWORD.期权特殊类型',
                                            '交易日期', '到期日', '名义本金', '总盈亏',
                                            '期权估值 NPV', 'DELTA(期权)', 'GAMMA', 'VEGA']].copy()
@@ -743,8 +873,29 @@ def main():
 
         # 准备数据（包含所有状态，包括TERMINATED）
         if selected_trade_id == '全部':
-            # 获取所有标的列表
-            underlying_list = sorted(otc_trade['标的名称'].unique().tolist())
+            # 添加TRS筛选选项
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                trs_filter = st.radio(
+                    "数据范围",
+                    ["包括TRS", "不包括TRS（仅期权）"],
+                    horizontal=True,
+                    key="trs_filter",
+                    help="TRS是期权类型为空(NaN)的交易"
+                )
+
+            # 根据TRS筛选条件过滤数据
+            if trs_filter == "不包括TRS（仅期权）":
+                # 排除期权类型为NaN的记录（即TRS）
+                otc_trade_filtered = otc_trade[otc_trade['TRADE_KEYWORD.期权特殊类型'].notna()].copy()
+                st.info(f"📊 当前显示：仅期权交易（已排除 {len(otc_trade) - len(otc_trade_filtered)} 笔TRS交易）")
+            else:
+                otc_trade_filtered = otc_trade.copy()
+                trs_count = otc_trade[otc_trade['TRADE_KEYWORD.期权特殊类型'].isna()]['Trade Id'].nunique()
+                st.info(f"📊 当前显示：所有交易（包含 {trs_count} 笔TRS交易）")
+
+            # 获取筛选后的标的列表
+            underlying_list = sorted(otc_trade_filtered['标的名称'].unique().tolist())
 
             # 添加可视化模式选择
             viz_mode = st.radio(
@@ -756,8 +907,8 @@ def main():
 
             if viz_mode == "组合级指标(仅Vega/Theta)":
                 # 仅显示可跨标的加总的指标：Vega、Theta、Rho
-                # 按观察日直接汇总
-                time_series_data = otc_trade.groupby('观察日').agg({
+                # 按观察日直接汇总（使用筛选后的数据）
+                time_series_data = otc_trade_filtered.groupby('观察日').agg({
                     '期权估值（报送）': 'sum',
                     '期权估值 NPV': 'sum',
                     '期权费估值': 'sum',
@@ -784,8 +935,8 @@ def main():
                 # 选择单一标的查看详细信息
                 selected_underlying = st.selectbox("选择标的资产", underlying_list, index=0, key="underlying_selector")
 
-                # 按选定标的筛选数据
-                underlying_data = otc_trade[otc_trade['标的名称'] == selected_underlying].copy()
+                # 按选定标的筛选数据（使用筛选后的数据）
+                underlying_data = otc_trade_filtered[otc_trade_filtered['标的名称'] == selected_underlying].copy()
 
                 # 按观察日直接汇总该标的的所有记录
                 time_series_data = underlying_data.groupby('观察日').agg({
@@ -815,10 +966,12 @@ def main():
                 st.plotly_chart(greeks_fig, use_container_width=True)
 
             else:  # 分资产对比图模式
-                # 准备按标的分组的数据
+                # 准备按标的分组的数据（使用筛选后的数据）
                 # 按观察日和标的名称直接汇总
-                underlying_summary = otc_trade.groupby(['观察日', '标的名称']).agg({
+                underlying_summary = otc_trade_filtered.groupby(['观察日', '标的名称']).agg({
                     'spot price': 'first',
+                    'delta': 'sum',
+                    'delta cash': 'sum',
                     'DELTA(期权)': 'sum',
                     'GAMMA': 'sum',
                     'VEGA（1%）': 'sum',
@@ -830,7 +983,7 @@ def main():
                 # 选择要展示的希腊值
                 greek_to_plot = st.selectbox(
                     "选择希腊值指标",
-                    ['DELTA(期权)', 'GAMMA', 'VEGA（1%）', 'THETA', '总盈亏', '隔夜盈亏'],
+                    ['delta', 'delta cash', 'GAMMA', 'VEGA（1%）', 'THETA', '总盈亏', '隔夜盈亏'],
                     index=0,
                     key="greek_selector"
                 )
@@ -841,16 +994,67 @@ def main():
                 elif greek_to_plot == '隔夜盈亏':
                     st.info("💡 隔夜盈亏是单日增量值，显示该日的盈亏变化")
 
-                # 创建分资产对比图
-                fig = go.Figure()
-
                 colors = ['royalblue', 'firebrick', 'green', 'purple', 'orange', 'brown', 'pink', 'cyan']
+
+                # 第一张图：现货价格对比（双轴折线图）
+                st.markdown("#### 现货价格走势")
+
+                # 创建带有次坐标轴的图表
+                fig_spot = make_subplots(specs=[[{"secondary_y": True}]])
+
+                # 将标的资产分为两组，一组用主轴，一组用次轴
+                mid_point = len(underlying_list) // 2
 
                 for idx, underlying in enumerate(underlying_list):
                     underlying_df = underlying_summary[underlying_summary['标的名称'] == underlying]
 
                     if not underlying_df.empty:
-                        fig.add_trace(go.Scatter(
+                        # 前半部分用主轴，后半部分用次轴
+                        use_secondary = idx >= mid_point
+
+                        fig_spot.add_trace(
+                            go.Scatter(
+                                x=underlying_df['观察日'],
+                                y=underlying_df['spot price'],
+                                name=underlying,
+                                mode='lines+markers',
+                                line=dict(color=colors[idx % len(colors)], width=2),
+                                marker=dict(size=5)
+                            ),
+                            secondary_y=use_secondary
+                        )
+
+                # 更新布局
+                fig_spot.update_layout(
+                    title='Spot Price - 按标的资产对比（双轴）',
+                    xaxis_title='观察日',
+                    template='plotly_white',
+                    hovermode='x unified',
+                    legend=dict(
+                        bordercolor='black',
+                        borderwidth=1
+                    ),
+                    height=500
+                )
+
+                # 设置Y轴标题
+                fig_spot.update_yaxes(title_text="Spot Price (主轴)", secondary_y=False)
+                fig_spot.update_yaxes(title_text="Spot Price (次轴)", secondary_y=True)
+
+                fig_spot.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
+                fig_spot.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
+
+                st.plotly_chart(fig_spot, use_container_width=True)
+
+                # 第二张图：选择的希腊值指标对比
+                st.markdown(f"#### {greek_to_plot} 对比")
+                fig_greek = go.Figure()
+
+                for idx, underlying in enumerate(underlying_list):
+                    underlying_df = underlying_summary[underlying_summary['标的名称'] == underlying]
+
+                    if not underlying_df.empty:
+                        fig_greek.add_trace(go.Scatter(
                             x=underlying_df['观察日'],
                             y=underlying_df[greek_to_plot],
                             name=underlying,
@@ -859,7 +1063,7 @@ def main():
                             marker=dict(size=5)
                         ))
 
-                fig.update_layout(
+                fig_greek.update_layout(
                     title=f'{greek_to_plot} - 按标的资产对比',
                     xaxis_title='观察日',
                     yaxis_title=greek_to_plot,
@@ -869,13 +1073,13 @@ def main():
                         bordercolor='black',
                         borderwidth=1
                     ),
-                    height=600
+                    height=500
                 )
 
-                fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
-                fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
+                fig_greek.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
+                fig_greek.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
 
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig_greek, use_container_width=True)
 
         else:
             # 单个交易的希腊值分析
